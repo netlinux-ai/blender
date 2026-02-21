@@ -1,0 +1,184 @@
+name: Build .deb package
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          sudo apt-get clean
+          df -h /
+
+      - name: Install system build dependencies
+        run: |
+          sudo sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake git git-lfs subversion \
+            checkinstall \
+            libx11-dev libxxf86vm-dev libxcursor-dev libxi-dev \
+            libxrandr-dev libxinerama-dev libegl-dev \
+            libwayland-dev wayland-protocols libxkbcommon-dev \
+            libdbus-1-dev linux-libc-dev \
+            libepoxy-dev libdecor-0-dev \
+            libpulse-dev libjack-dev libsndfile1-dev \
+            python3-dev python3-numpy \
+            libtbb-dev libboost-all-dev \
+            libopenexr-dev libilmbase-dev \
+            libopencolorio-dev \
+            libopenimageio-dev \
+            libopenvdb-dev \
+            libblosc-dev \
+            libfftw3-dev \
+            libjpeg-dev libpng-dev libtiff-dev libwebp-dev \
+            libfreetype-dev libfontconfig-dev \
+            libxml2-dev libyaml-cpp-dev \
+            libhpdf-dev libpugixml-dev \
+            libpotrace-dev libgmp-dev \
+            zlib1g-dev liblzma-dev liblzo2-dev \
+            libzstd-dev libminizip-dev \
+            libsdl2-dev \
+            libalembic-dev \
+            libosl-dev \
+            libembree-dev \
+            libmaterialx-dev \
+            nasm yasm
+
+      - name: Clone Blender source
+        run: |
+          git clone --depth 1 --branch v5.0.1 \
+            https://projects.blender.org/blender/blender.git blender-src
+          cd blender-src
+          git lfs install
+          git lfs pull
+          make update
+
+      - name: Apply NetLinux patches
+        run: |
+          cd blender-src
+          for p in ../patches/*.patch; do
+            [ -f "$p" ] || continue
+            echo "Applying $(basename $p)..."
+            git apply "$p"
+          done
+
+      - name: Build Blender
+        run: |
+          cd blender-src
+          make release 2>&1 | tail -100
+
+      - name: Install to staging
+        run: |
+          cd ../build_linux_release
+          sudo make install DESTDIR=/tmp/staging
+
+      - name: Determine version
+        id: version
+        run: |
+          base=$(cmake --build ../build_linux_release --target print_version 2>/dev/null \
+            || echo "5.0.1")
+          # Fallback: extract from CMakeLists if cmake target unavailable
+          if [ "$base" = "5.0.1" ]; then
+            base=$(grep 'set(BLENDER_VERSION' blender-src/CMakeLists.txt \
+              | head -1 | grep -oP '[\d.]+' || echo "5.0.1")
+          fi
+          rev=${{ github.run_number }}
+          echo "version=${base}-${rev}netlinux1" >> "$GITHUB_OUTPUT"
+          echo "tag=v${base}-${rev}netlinux1" >> "$GITHUB_OUTPUT"
+
+      - name: Package with checkinstall
+        run: |
+          cd ../build_linux_release
+          echo "Blender 3D creation suite - custom netlinux build with all features" > description-pak
+          sudo checkinstall --default \
+            --pkgname=blender \
+            --pkgversion="${{ steps.version.outputs.version }}" \
+            --maintainer="graham@netlinux.co.uk" \
+            --requires="libx11-6,libxi6,libxrandr2,libxinerama1,libxcursor1,\
+          libxxf86vm1,libegl1,libwayland-client0,libdecor-0-0,libxkbcommon0,\
+          libdbus-1-3,libepoxy0,libpulse0,libsndfile1,\
+          python3,python3-numpy,libtbb12,\
+          libopenexr-3-1-30,libopencolorio2.1t64,libopenimageio2.5t64,\
+          libopenvdb11.0t64,libblosc1,libfftw3-3,\
+          libjpeg8,libpng16-16t64,libtiff6,libwebp7,\
+          libfreetype6,libfontconfig1,libsdl2-2.0-0,\
+          libembree4-4,shared-mime-info" \
+            --pakdir=. \
+            --install=no \
+            --fstrans=no \
+            bash -c 'cp -a /tmp/staging/usr/* /usr/'
+
+      - name: Repack .deb for reprepro compatibility
+        run: |
+          cd ../build_linux_release
+          DEB=$(ls blender_*.deb)
+          sudo chmod 666 "$DEB"
+          mkdir repack && cd repack
+          ar x "../$DEB"
+
+          for f in *.zst; do
+            [ -f "$f" ] || continue
+            zstd -d "$f"
+            xz "${f%.zst}"
+            rm "$f"
+          done
+
+          mkdir control_dir
+          cd control_dir
+          tar xf ../control.tar.xz
+          cat > postinst << 'POSTINST'
+          #!/bin/sh
+          set -e
+          if [ "$1" = "configure" ] && command -v update-desktop-database >/dev/null 2>&1; then
+            update-desktop-database /usr/share/applications || true
+          fi
+          if [ "$1" = "configure" ] && command -v update-mime-database >/dev/null 2>&1; then
+            update-mime-database /usr/share/mime || true
+          fi
+          POSTINST
+          chmod 755 postinst
+          tar cJf ../control.tar.xz .
+          cd ..
+          rm -rf control_dir
+
+          rm "../$DEB"
+          ar rcs "../$DEB" debian-binary control.tar.xz data.tar.xz
+          mv "../$DEB" "$GITHUB_WORKSPACE/"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: blender ${{ steps.version.outputs.version }}
+          body: |
+            Automated build from commit ${{ github.sha }}
+
+            Blender 5.0.1 with all features enabled.
+
+            Install: `sudo dpkg -i blender_*.deb`
+          files: blender_*.deb
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Notify package repository
+        run: |
+          sleep 5
+          SIGNATURE=$(echo -n '{"repo":"netlinux-ai/blender","tag":"${{ steps.version.outputs.tag }}"}' \
+            | openssl dgst -sha256 -hmac "${{ secrets.WEBHOOK_SECRET }}" -binary \
+            | xxd -p -c 256)
+          curl -sf -X POST \
+            -H "Content-Type: application/json" \
+            -H "X-Webhook-Signature: sha256=${SIGNATURE}" \
+            -d '{"repo":"netlinux-ai/blender","tag":"${{ steps.version.outputs.tag }}"}' \
+            https://packages.netlinux.co.uk/webhook/update-repo
