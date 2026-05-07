@@ -1,4 +1,4 @@
-name: Build .deb package
+name: Build .deb package (dual-suite)
 
 on:
   push:
@@ -9,24 +9,41 @@ permissions:
 
 jobs:
   build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: bookworm
+            container: debian:bookworm
+          - target: resolute
+            container: ubuntu:26.04
     runs-on: ubuntu-24.04
+    container:
+      image: ${{ matrix.container }}
 
     steps:
+      - name: Bootstrap container
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl git xz-utils zstd
+
       - uses: actions/checkout@v4
 
       - name: Free disk space
         run: |
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+          rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
             /usr/local/graalvm /usr/local/share/powershell \
             /usr/local/lib/node_modules /usr/local/share/chromium \
             /opt/hostedtoolcache
-          sudo apt-get clean
+          apt-get clean
           df -h /
+
 
       - name: Install system build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          apt-get update
+          apt-get install -y \
             build-essential cmake git git-lfs subversion \
             checkinstall \
             libx11-dev libxxf86vm-dev libxcursor-dev libxi-dev \
@@ -48,12 +65,14 @@ jobs:
             nasm yasm \
             patchelf
 
+
       - name: Clone Blender source
         run: |
           git clone --depth 1 --branch v5.0.1 \
             https://projects.blender.org/blender/blender.git blender-src
           cd blender-src
           make update
+
 
       - name: Apply NetLinux patches
         run: |
@@ -64,6 +83,7 @@ jobs:
             git apply "$p"
           done
 
+
       - name: Build Blender
         run: |
           cd blender-src
@@ -71,23 +91,26 @@ jobs:
           echo "Build complete"
           ls -lh ../build_linux_release/bin/
 
+
       - name: Install to staging
         run: |
           cd build_linux_release
           sudo cmake --install . --prefix /tmp/staging/usr
+
 
       - name: Determine version
         id: version
         run: |
           base="5.0.1"
           rev=${{ github.run_number }}
-          echo "version=${base}-${rev}netlinux1" >> "$GITHUB_OUTPUT"
-          echo "tag=v${base}-${rev}netlinux1" >> "$GITHUB_OUTPUT"
+          echo "version=${base}-${rev}netlinux1~${{ matrix.target }}1" >> "$GITHUB_OUTPUT"
+          echo "tag=v${base}-${rev}netlinux1~${{ matrix.target }}1" >> "$GITHUB_OUTPUT"
+
 
       - name: Package with checkinstall
         run: |
           echo "Blender 5.0 3D creation suite - custom netlinux build" > description-pak
-          sudo checkinstall --default \
+          checkinstall --default \
             --pkgname=blender \
             --pkgversion="${{ steps.version.outputs.version }}" \
             --maintainer="graham@netlinux.co.uk" \
@@ -103,10 +126,11 @@ jobs:
             --fstrans=no \
             bash -c 'cp -a /tmp/staging/usr/* /usr/'
 
+
       - name: Repack .deb for reprepro compatibility
         run: |
           DEB=$(ls blender_*.deb)
-          sudo chmod 666 "$DEB"
+          chmod 666 "$DEB"
           mkdir repack && cd repack
           ar x "../$DEB"
 
@@ -138,29 +162,50 @@ jobs:
           rm "../$DEB"
           ar rcs "../$DEB" debian-binary control.tar.xz data.tar.xz
 
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.target }}
+          path: |
+            **/*.deb
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Compute tag
+        id: tag
+        run: echo "tag=v${{ github.run_number }}-dualsuite" >> "$GITHUB_OUTPUT"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          name: blender ${{ steps.version.outputs.version }}
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: Build ${{ github.run_number }} (bookworm + resolute)
           body: |
-            Automated build from commit ${{ github.sha }}
-
-            Blender 5.0.1 with all features enabled.
-
-            Install: `sudo dpkg -i blender_*.deb`
-          files: blender_*.deb
+            Dual-suite build from commit ${{ github.sha }}.
+            Both ~bookworm1 and ~resolute1 .debs are attached.
+          files: artifacts/**/*.deb
+          fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Notify package repository
         run: |
           sleep 5
-          SIGNATURE=$(echo -n '{"repo":"netlinux-ai/blender","tag":"${{ steps.version.outputs.tag }}"}' \
+          PAYLOAD='{"repo":"netlinux-ai/blender","tag":"${{ steps.tag.outputs.tag }}"}'
+          SIGNATURE=$(echo -n "$PAYLOAD" \
             | openssl dgst -sha256 -hmac "${{ secrets.WEBHOOK_SECRET }}" -binary \
             | xxd -p -c 256)
           curl -sf -X POST \
             -H "Content-Type: application/json" \
             -H "X-Webhook-Signature: sha256=${SIGNATURE}" \
-            -d '{"repo":"netlinux-ai/blender","tag":"${{ steps.version.outputs.tag }}"}' \
+            -d "$PAYLOAD" \
             https://packages.netlinux.co.uk/webhook/update-repo
