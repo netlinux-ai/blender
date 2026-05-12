@@ -1,28 +1,127 @@
-name: Trigger dev build
-# All build/test/publish happens on dev (the netlinux nightly host).
-# This GHA workflow is a thin trigger: on every push, sign and POST the
-# commit info to the apt-server webhook, which SSHes to dev and starts
-# a single-repo build for both bookworm and resolute suites.
-
-on:
+# Build manifest — replayed by the netlinux dev pipeline.
+# Not auto-triggered in GHA; use `gh workflow run release-deb.yml` to
+# run manually on a GitHub-hosted runner.
+name: Build .deb package (dual-suite)
+true:
   push:
-
+    branches:
+    - main
+permissions:
+  contents: write
 jobs:
-  trigger:
-    runs-on: ubuntu-latest
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - target: bookworm
+          container: debian:bookworm
+        - target: resolute
+          container: ubuntu:26.04
+    runs-on: ubuntu-24.04
+    container:
+      image: ${{ matrix.container }}
     steps:
-      - name: Notify dev build pipeline
-        env:
-          REPO: ${{ github.repository }}
-          SHA: ${{ github.sha }}
-          REF: ${{ github.ref }}
-          SECRET: ${{ secrets.WEBHOOK_SECRET }}
-        run: |
-          PAYLOAD=$(printf '{"repo":"%s","sha":"%s","ref":"%s"}' "$REPO" "$SHA" "$REF")
-          SIGNATURE=$(printf %s "$PAYLOAD" | openssl dgst -sha256 -hmac "$SECRET" -binary | xxd -p -c 256)
-          echo "Dispatching build for $REPO @ ${SHA:0:8} ($REF)"
-          curl -sSf -X POST \
-            -H "Content-Type: application/json" \
-            -H "X-Webhook-Signature: sha256=${SIGNATURE}" \
-            -d "$PAYLOAD" \
-            https://packages.netlinux.co.uk/webhook/build
+    - name: Bootstrap container
+      run: "apt-get update\napt-get install -y --no-install-recommends \\\n  ca-certificates curl git xz-utils zstd \\\n \
+        \ build-essential dpkg-dev sudo\n"
+    - uses: actions/checkout@v4
+    - name: Free disk space
+      run: "rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \\\n  /usr/local/graalvm /usr/local/share/powershell\
+        \ \\\n  /usr/local/lib/node_modules /usr/local/share/chromium \\\n  /opt/hostedtoolcache\napt-get clean\ndf -h /\n"
+    - name: Install system build dependencies
+      run: "apt-get update\napt-get install -y \\\n  build-essential cmake git git-lfs subversion \\\n  checkinstall \\\n\
+        \  libx11-dev libxxf86vm-dev libxcursor-dev libxi-dev \\\n  libxrandr-dev libxinerama-dev libegl-dev \\\n  libwayland-dev\
+        \ wayland-protocols libxkbcommon-dev \\\n  libdbus-1-dev linux-libc-dev \\\n  libepoxy-dev libdecor-0-dev \\\n  libpulse-dev\
+        \ libjack-dev libsndfile1-dev \\\n  python3-dev python3-numpy \\\n  libfftw3-dev \\\n  libjpeg-dev libpng-dev libtiff-dev\
+        \ libwebp-dev \\\n  libfreetype-dev libfontconfig-dev \\\n  libxml2-dev libyaml-cpp-dev \\\n  libhpdf-dev libpugixml-dev\
+        \ \\\n  libpotrace-dev libgmp-dev \\\n  zlib1g-dev liblzma-dev liblzo2-dev \\\n  libzstd-dev libminizip-dev \\\n \
+        \ libsdl2-dev \\\n  nasm yasm \\\n  patchelf\n"
+    - name: Clone Blender source
+      run: "git clone --depth 1 --branch v5.0.1 \\\n  https://projects.blender.org/blender/blender.git blender-src\ncd blender-src\n\
+        make update\n"
+    - name: Apply NetLinux patches
+      run: "cd blender-src\nfor p in ../patches/*.patch; do\n  [ -f \"$p\" ] || continue\n  echo \"Applying $(basename $p)...\"\
+        \n  git apply \"$p\"\ndone\n"
+    - name: Build Blender
+      run: 'cd blender-src
+
+        make release 2>&1 | tail -200
+
+        echo "Build complete"
+
+        ls -lh ../build_linux_release/bin/
+
+        '
+    - name: Install to staging
+      run: 'cd build_linux_release
+
+        sudo cmake --install . --prefix /tmp/staging/usr
+
+        '
+    - name: Determine version
+      id: version
+      run: 'base="5.0.1"
+
+        rev=${{ github.run_number }}
+
+        echo "version=${base}-${rev}netlinux1~${{ matrix.target }}1" >> "$GITHUB_OUTPUT"
+
+        echo "tag=v${base}-${rev}netlinux1~${{ matrix.target }}1" >> "$GITHUB_OUTPUT"
+
+        '
+    - name: Package with checkinstall
+      run: "echo \"Blender 5.0 3D creation suite - custom netlinux build\" > description-pak\ncheckinstall --default \\\n\
+        \  --pkgname=blender \\\n  --pkgversion=\"${{ steps.version.outputs.version }}\" \\\n  --maintainer=\"graham@netlinux.co.uk\"\
+        \ \\\n  --requires=\"libx11-6,libxi6,libxrandr2,libxinerama1,libxcursor1,\\\nlibxxf86vm1,libegl1,libwayland-client0,libdecor-0-0,libxkbcommon0,\\\
+        \nlibdbus-1-3,libepoxy0,libpulse0,libsndfile1,\\\npython3,python3-numpy,libfftw3-double3,\\\nlibjpeg8,libpng16-16t64,libtiff6,libwebp7,\\\
+        \nlibfreetype6,libfontconfig1,libsdl2-2.0-0,\\\nshared-mime-info\" \\\n  --pakdir=. \\\n  --install=no \\\n  --fstrans=no\
+        \ \\\n  bash -c 'cp -a /tmp/staging/usr/* /usr/'\n"
+    - name: Repack .deb for reprepro compatibility
+      run: "DEB=$(ls blender_*.deb)\nchmod 666 \"$DEB\"\nmkdir repack && cd repack\nar x \"../$DEB\"\n\nfor f in *.zst; do\n\
+        \  [ -f \"$f\" ] || continue\n  zstd -d \"$f\"\n  xz \"${f%.zst}\"\n  rm \"$f\"\ndone\n\nmkdir control_dir\ncd control_dir\n\
+        tar xf ../control.tar.xz\ncat > postinst << 'POSTINST'\n#!/bin/sh\nset -e\nif [ \"$1\" = \"configure\" ] && command\
+        \ -v update-desktop-database >/dev/null 2>&1; then\n  update-desktop-database /usr/share/applications || true\nfi\n\
+        if [ \"$1\" = \"configure\" ] && command -v update-mime-database >/dev/null 2>&1; then\n  update-mime-database /usr/share/mime\
+        \ || true\nfi\nPOSTINST\nchmod 755 postinst\ntar cJf ../control.tar.xz .\ncd ..\nrm -rf control_dir\n\nrm \"../$DEB\"\
+        \nar rcs \"../$DEB\" debian-binary control.tar.xz data.tar.xz\n"
+    - uses: actions/upload-artifact@v4
+      with:
+        name: deb-${{ matrix.target }}
+        path: '**/*.deb
+
+          '
+        if-no-files-found: error
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+    - name: Compute tag
+      id: tag
+      run: echo "tag=v${{ github.run_number }}-dualsuite" >> "$GITHUB_OUTPUT"
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ steps.tag.outputs.tag }}
+        name: Build ${{ github.run_number }} (bookworm + resolute)
+        body: 'Dual-suite build from commit ${{ github.sha }}.
+
+          Both ~bookworm1 and ~resolute1 .debs are attached.
+
+          '
+        files: artifacts/**/*.deb
+        fail_on_unmatched_files: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Notify package repository
+      run: "sleep 5\nPAYLOAD='{\"repo\":\"netlinux-ai/blender\",\"tag\":\"${{ steps.tag.outputs.tag }}\"}'\nSIGNATURE=$(echo\
+        \ -n \"$PAYLOAD\" \\\n  | openssl dgst -sha256 -hmac \"${{ secrets.WEBHOOK_SECRET }}\" -binary \\\n  | xxd -p -c 256)\n\
+        curl -sf -X POST \\\n  -H \"Content-Type: application/json\" \\\n  -H \"X-Webhook-Signature: sha256=${SIGNATURE}\"\
+        \ \\\n  -d \"$PAYLOAD\" \\\n  https://packages.netlinux.co.uk/webhook/update-repo\n"
+'on':
+  workflow_dispatch: null
